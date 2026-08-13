@@ -2,8 +2,9 @@ name: NOI 晚间日报
 
 on:
   schedule:
-    # 工作日 21:35 HKT = 13:35 UTC（周一到周五）
-    - cron: "35 13 * * 1-5"
+    # 工作日 21:10 HKT = 13:10 UTC（周一到周五）
+    # 提前 25min 触发，对冲 GitHub Actions cron 延迟
+    - cron: "10 13 * * 1-5"
   workflow_dispatch: # 支持手动触发
 
 permissions:
