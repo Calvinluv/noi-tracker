@@ -339,16 +339,27 @@ def generate_html(results, today_date, base_label, report_type, anomalies=None):
             else:
                 vol_amplified = " 未显著放大"
 
-            # 市场解读
+            # 市场解读（2026-08-13 修正：采用实战派解读）
+            # 用户原话：「连续阴线 + NOI 增 = 空头主导，淡仓在获利并加仓 short」，
+            #           旧解读「多头逢低建仓」是教科书说法，未考虑连续性背景。
+            # 新逻辑：所有"NOI 增 + 阴线"一律按「空头主导」解读；
+            #        "NOI 增 + 阳线"才是多头建仓（多头推升价格且 NOI 增才合逻辑）。
             noi_up = a["total_pct"] >= 0
             if noi_up and not is_bullish:
-                interpretation = "多头逢低建仓/空头回补，下跌中逆势做多，偏多信号需验证"
+                interpretation = (
+                    "净多头增 + 阴线：空头主导（淡仓获利 + 加仓 short 压制），"
+                    "若连续多日同方向，空头格局明确，警惕进一步下跌"
+                )
             elif noi_up and is_bullish:
-                interpretation = "多头积极建仓，看多信号"
+                interpretation = "净多头增 + 阳线：多头主动建仓推升价格，看多信号"
             elif not noi_up and not is_bullish:
-                interpretation = "多头止损离场，偏空信号"
+                interpretation = (
+                    "净多头减 + 阴线：多头止损离场 + 空头加仓 short，明确偏空信号"
+                )
             else:
-                interpretation = "多头获利了结/空头回补"
+                interpretation = (
+                    "净多头减 + 阳线：多头获利了结 + 空头回补，警惕上涨末期"
+                )
 
             anomaly_sections += f"""
       <table style="margin-bottom:16px;">
