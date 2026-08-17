@@ -6,7 +6,10 @@ import re
 import json
 import os
 import requests
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
+
+# HKT 时区 (UTC+8)，GitHub Actions runner 默认 UTC
+HKT = timezone(timedelta(hours=8))
 
 # ── 常量 ──────────────────────────────────────────────
 BASE_URL = "https://www.etnet.com.hk/www/tc/futures/index.php"
@@ -56,7 +59,7 @@ def determine_contracts():
     match = re.search(r'恒生指數期貨\((\d{2})/(\d{4})\)', html)
     if not match:
         # fallback: 用当前月份
-        now = datetime.now()
+        now = datetime.now(HKT)
         near = f"{now.year}{now.month:02d}"
     else:
         near = f"{match.group(2)}{match.group(1)}"
@@ -614,11 +617,11 @@ def build_wechat_alert(anomalies):
 
 # ── 工具 ──────────────────────────────────────────────
 def get_today_str():
-    return datetime.now().strftime("%Y-%m-%d")
+    return datetime.now(HKT).strftime("%Y-%m-%d")
 
 
 def get_today_compact():
-    return datetime.now().strftime("%Y%m%d")
+    return datetime.now(HKT).strftime("%Y%m%d")
 
 
 def save_turnover(results_data, contracts):
