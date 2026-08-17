@@ -45,9 +45,11 @@ def main():
     base_noi = base_data.get("data", {}) if base_data else {}
     results = compute_summary(today_data, base_noi, contracts)
     for r in results:
-        print(f"  {r['product']}: 合计 {r['today_total']:,} vs {r['base_total'] or '—'}, "
-              f"变化 {r['total_change'] or '—'} ({r['total_pct']:.2f}%)" if r['total_pct'] else
-              f"  {r['product']}: 合计 {r['today_total']:,} (首次记录)")
+        if r['total_pct'] is not None:
+            print(f"  {r['product']}: 合计 {r['today_total']:,} vs {r['base_total'] or '—'}, "
+                  f"变化 {r['total_change'] or '—'} ({r['total_pct']:.2f}%)")
+        else:
+            print(f"  {r['product']}: 合计 {r['today_total']:,} (首次记录)")
 
     # 步骤3.5：检测异常
     print("\n[步骤3.5] 检测异常波动...")
