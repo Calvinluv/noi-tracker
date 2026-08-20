@@ -4,7 +4,7 @@ on:
   schedule:
     # 工作日 07:00 HKT = 23:00 UTC 前一天（周一到周五）
     # 提前 1.5h 触发，对冲 GitHub Actions cron 延迟
-    - cron: "0 23 * * 0-4"
+    - cron: "30 0* * 1-5"
   workflow_dispatch: # 支持手动触发
 
 permissions:
