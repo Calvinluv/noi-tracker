@@ -5,6 +5,7 @@ noi_common.py — 香港指数期货 NOI 公共模块
 import re
 import json
 import os
+import time
 import requests
 from datetime import datetime, timedelta, timezone
 
@@ -41,12 +42,28 @@ MORNING_FILE = os.path.join(DATA_DIR, "noi_morning_latest.json")
 
 
 # ── 网络抓取 ──────────────────────────────────────────
-def fetch_url(url, timeout=30):
-    """抓取 URL，返回 HTML 文本"""
-    resp = requests.get(url, headers=HEADERS, timeout=timeout)
-    resp.raise_for_status()
-    resp.encoding = "utf-8"
-    return resp.text
+def fetch_url(url, timeout=30, attempts=3, backoff=2.0):
+    """
+    抓取 URL，返回 HTML 文本。
+
+    2026-09-21 修复：etnet 偶发 TLS 握手失败 / 连接被重置，且高发于"每次运行的首个请求"。
+    原实现单次失败即放弃，导致该合约静默变成 None（今早 HSI 即月就是这样丢的）。
+    改为带指数退避的多次重试。
+    """
+    last_err = None
+    for i in range(1, attempts + 1):
+        try:
+            resp = requests.get(url, headers=HEADERS, timeout=timeout)
+            resp.raise_for_status()
+            resp.encoding = "utf-8"
+            return resp.text
+        except Exception as e:
+            last_err = e
+            if i < attempts:
+                wait = backoff * i
+                print(f"    ↻ 请求失败（{type(e).__name__}: {e}），{wait:.0f}s 后第 {i + 1} 次重试")
+                time.sleep(wait)
+    raise last_err
 
 
 def determine_contracts():
@@ -80,7 +97,7 @@ def parse_futures_page(html):
     从期货页面 HTML 中提取 NOI、到期日、今日升跌。
     返回 dict: {noi: int, expiry: str, change: str, change_pct: str}
     """
-    result = {"noi": None, "expiry": None, "change": None, "change_pct": None}
+    result = {"noi": None, "expiry": None, "change": None, "change_pct": None, "nominal": None}
 
     # NOI: "未平倉淨數 (NOI)︰ 27,702"
     noi_match = re.search(r'未平倉淨數\s*\(NOI\).*?(\d[\d,]+)', html, re.DOTALL)
@@ -92,36 +109,88 @@ def parse_futures_page(html):
     if expiry_match:
         result["expiry"] = expiry_match.group(1)
 
-    # 今日升跌: 清理 HTML 标签后搜索 "日市 25,408 -220 (-0.86%)"
-    clean_text = re.sub(r'<[^>]+>', '\n', html)
-    clean_text = re.sub(r'\n\s*\n', '\n', clean_text)
-    change_match = re.search(r'日市\s+[\d,]+\s+(-?[\d,]+)\s*\((-?[\d.]+%)\)', clean_text)
-    if change_match:
-        result["change"] = change_match.group(1)
-        result["change_pct"] = change_match.group(2)
+    # 今日升跌
+    # 2026-09-21 修复：etnet 改版为卡片结构后，旧的「扁平文本」正则
+    # （r'日市\s+[\d,]+\s+(-?[\d,]+)\s*\((-?[\d.]+%)\)'）再也匹配不到，
+    # 导致报表「价格涨跌」恒为 "—"，异常解读被强制按「阴线」处理，系统性偏空。
+    # 现改为按 DOM 定位「日市」卡片，旧正则降级为兜底。
+    session_match = re.search(
+        r'<span class="label relative align-middle">日市</span>'          # 锁定日市卡片
+        r'.*?<div class="futures-home-nominal[^"]*"[^>]*>([\d,]+)</div>'
+        r'.*?<div class="futures-home-change-group">'
+        r'\s*<span class="futures-home-change-item">(-?[\d,]+)</span>'
+        r'\s*<span class="futures-home-change-item">\((-?[\d.]+%)\)</span>',
+        html, re.DOTALL)
+    if session_match:
+        result["nominal"] = session_match.group(1)
+        result["change"] = session_match.group(2)
+        result["change_pct"] = session_match.group(3)
+    else:
+        clean_text = re.sub(r'<[^>]+>', '\n', html)
+        clean_text = re.sub(r'\n\s*\n', '\n', clean_text)
+        change_match = re.search(r'日市\s+[\d,]+\s+(-?[\d,]+)\s*\((-?[\d.]+%)\)', clean_text)
+        if change_match:
+            result["change"] = change_match.group(1)
+            result["change_pct"] = change_match.group(2)
 
     return result
 
 
-def fetch_all_noi(contracts):
+def _empty_slot():
+    return {"noi": None, "expiry": None, "change": None, "change_pct": None, "nominal": None}
+
+
+def _fetch_one(product, month):
+    """抓取单个「品种 × 月份」。解析不到 NOI 视为失败（而非静默成功）。"""
+    url = f"{BASE_URL}?subtype={product}&month={month}&tab=interval"
+    html = fetch_url(url)
+    parsed = parse_futures_page(html)
+    if parsed["noi"] is None:
+        raise ValueError("页面已返回但解析不到 NOI（疑似页面结构变化或限流页）")
+    return parsed
+
+
+def missing_keys(data):
+    """返回 NOI 为 None 的 key 列表，供调用方判定抓取是否完整。"""
+    return [k for k, v in data.items() if v.get("noi") is None]
+
+
+def fetch_all_noi(contracts, extra_passes=2):
     """
     抓取三大品种 × 两个月份的 NOI 数据。
     contracts: (near_month, far_month)，格式 "YYYYMM"
     返回 dict: {"HSI_202608": {noi, expiry, change, change_pct}, ...}
+
+    2026-09-21 修复：
+    - fetch_url 内部已带重试，此处再做若干轮「补抓」，专门对付首请求失败；
+    - 解析不到 NOI 不再算成功，会显式抛错并进入补抓；
+    - 最终若仍有缺失，由 missing_keys() 检出，交由调用方中止而不是产出错误报表。
     """
     data = {}
     for product in ["HSI", "HHI", "HTI"]:
         for month in contracts:
             key = f"{product}_{month}"
-            url = f"{BASE_URL}?subtype={product}&month={month}&tab=interval"
             try:
-                html = fetch_url(url)
-                parsed = parse_futures_page(html)
-                data[key] = parsed
-                print(f"  ✅ {key}: NOI={parsed['noi']}, expiry={parsed['expiry']}, change={parsed['change']}")
+                data[key] = _fetch_one(product, month)
+                print(f"  ✅ {key}: NOI={data[key]['noi']}, expiry={data[key]['expiry']}, change={data[key]['change']}")
             except Exception as e:
                 print(f"  ❌ {key}: {e}")
-                data[key] = {"noi": None, "expiry": None, "change": None, "change_pct": None}
+                data[key] = _empty_slot()
+
+    for p in range(1, extra_passes + 1):
+        missing = missing_keys(data)
+        if not missing:
+            break
+        print(f"  🔁 第 {p} 轮补抓，缺失 {len(missing)} 项: {', '.join(missing)}")
+        time.sleep(5)
+        for key in missing:
+            product, month = key.split("_")
+            try:
+                data[key] = _fetch_one(product, month)
+                print(f"  ✅ 补抓成功 {key}: NOI={data[key]['noi']}")
+            except Exception as e:
+                print(f"  ❌ 补抓仍失败 {key}: {e}")
+
     return data
 
 
@@ -227,9 +296,12 @@ def compute_summary(data_today, data_base, contracts):
         near_change, near_pct = calc_change(today_near, base_near)
         far_change, far_pct = calc_change(today_far, base_far)
 
-        today_total = (today_near or 0) + (today_far or 0)
-        base_total = (base_near or 0) + (base_far or 0) if base_near is not None else None
-        total_change, total_pct = calc_change(today_total, base_total) if base_total else (None, None)
+        # 2026-09-21 修复：任一月份缺失时合计一律置 None。
+        # 原实现把 None 当 0 求和，制造出"HIS 合计 -93.53%"这种假暴跌，
+        # 还会误触发 3% 异常预警并推送完全错误的"偏空"解读。
+        today_total = (today_near + today_far) if (today_near is not None and today_far is not None) else None
+        base_total = (base_near + base_far) if (base_near is not None and base_far is not None) else None
+        total_change, total_pct = calc_change(today_total, base_total)
 
         results.append({
             "product": product,
@@ -251,6 +323,7 @@ def compute_summary(data_today, data_base, contracts):
             "total_pct": total_pct,
             "today_change": _get_field(data_today, near_key, "change"),
             "today_change_pct": _get_field(data_today, near_key, "change_pct"),
+            "incomplete": today_total is None,
         })
     return results
 
@@ -267,10 +340,25 @@ def generate_html(results, today_date, base_label, report_type, anomalies=None):
     badge_text = "晚间日市收盘" if report_type == "daily" else "夜市更新后"
 
     # 计算总计
-    grand_today = sum(r["today_total"] for r in results)
-    grand_base = sum(r["base_total"] for r in results if r["base_total"] is not None)
-    grand_change = grand_today - grand_base if grand_base else None
-    grand_pct = (grand_change / grand_base * 100) if grand_base else None
+    # 2026-09-21 修复：只要有品种数据不完整，总计一律置空。
+    # 原实现会把残缺数据（缺失当 0）跟完整基准相减，产出 "-13.10%" 这种假暴跌。
+    incomplete = [r["product"] for r in results if r["today_total"] is None]
+    if incomplete:
+        grand_today = grand_base = grand_change = grand_pct = None
+    else:
+        grand_today = sum(r["today_total"] for r in results)
+        grand_base = sum(r["base_total"] for r in results if r["base_total"] is not None)
+        grand_change = grand_today - grand_base if grand_base else None
+        grand_pct = (grand_change / grand_base * 100) if grand_base else None
+
+    data_quality_html = ""
+    if incomplete:
+        names = "、".join(PRODUCT_SHORT[p] for p in incomplete)
+        data_quality_html = (
+            '<div class="alert-banner" style="background:#fee2e2;border-left-color:#dc2626;color:#991b1b;">'
+            f'🚫 <b>数据不完整：</b>{names} 本次未取到 NOI。'
+            '相关行、品种合计与总计已置空，<b>本次变化不可作为交易参考</b>，请重跑 workflow。</div>'
+        )
 
     def fmt_num(n):
         return f"{n:,}" if n is not None else "—"
@@ -440,6 +528,7 @@ def generate_html(results, today_date, base_label, report_type, anomalies=None):
   <div><b>对比基准：</b>{base_label}</div>
   <div><b>活跃合约：</b>{results[0]['near_month'][:4]}/{results[0]['near_month'][4:]} + {results[0]['far_month'][:4]}/{results[0]['far_month'][4:]}</div>
 </div>
+{data_quality_html}
 {'<div class="alert-banner">⚠️ <b>异常波动预警：</b>有品种 NOI 变化超过 3%，详见下方分析。</div>' if anomalies else ''}
 <table>
   <thead>
@@ -512,7 +601,9 @@ def build_wechat_summary(results):
         name = PRODUCT_SHORT[r["product"]]
         change = r["total_change"]
         pct = r["total_pct"]
-        if change is None or pct is None:
+        if r["today_total"] is None:
+            lines.append(f"{name}: ⚠️ 数据缺失（本次抓取失败）")
+        elif change is None or pct is None:
             lines.append(f"{name}: {r['today_total']:,} (首次记录)")
         else:
             sign = "+" if change >= 0 else ""
