@@ -24,6 +24,21 @@ def main():
     print("\n[步骤1] 抓取今早 NOI 数据...")
     today_data = fetch_all_noi(contracts)
 
+    # 步骤1.5：完整性校验（2026-09-21 新增）
+    # 缺任一项就中止：不生成报表、不覆盖快照、退出码 1。
+    # 原因见 2026-09-21 事故——HSI 即月抓取失败后静默置空，
+    # 结果把 None 当 0 算出 HSI「-93.53%」，并推送了完全错误的偏空预警。
+    missing = missing_keys(today_data)
+    if missing:
+        msg = (
+            "⚠️ NOI 早盘抓取不完整\n"
+            f"缺失项：{', '.join(missing)}\n"
+            "已自动补抓仍失败，本次不生成报表、不更新快照，请手动重跑 workflow。"
+        )
+        print("\n" + msg)
+        push_wechat(f"⚠️ NOI早盘抓取失败 {today}", msg)
+        sys.exit(1)
+
     # 步骤2：读取昨晚数据
     print("\n[步骤2] 读取昨晚数据（对比基准）...")
     base_data = load_json(HISTORY_FILE)
